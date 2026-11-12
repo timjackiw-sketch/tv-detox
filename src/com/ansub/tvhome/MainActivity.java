@@ -15,8 +15,11 @@ import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Matrix;
+import android.graphics.Paint;
 import android.graphics.Typeface;
 import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.ColorDrawable;
@@ -122,6 +125,12 @@ public class MainActivity extends Activity {
     private static final int FOCUS_MS = 180, RADIUS_UP = 10;
     private static final Interpolator FOCUS_EASE = new DecelerateInterpolator(1.8f);
     private static final int ROW1_TOP = 604, ROW_STEP = 224;
+    // Photo wallpaper: copy a picture to the TV as wallpaper.jpg in this app's own folder, see PHOTO_FILE.
+    // Delete the file to go back to the gradients. The glass panel sits behind the app grid.
+    private static final String PHOTO_FILE = "wallpaper.jpg";
+    private static final int PANEL_PAD = 36, PANEL_RADIUS = 44;
+    // true: each app shows its icon and name on glass. false: the app's own TV banner, as before.
+    private static final boolean ICON_TILES = true;
     private static final int GRID_MIN_TOP = 400; // more rows push the grid up, but not into the clock
     private static final int ICON_TOP = 76, ICON_BUTTON = 72, ICON_SIZE = 40, ICON_GAP = 12; // level with the date
 
@@ -184,6 +193,8 @@ public class MainActivity extends Activity {
     // The network tile follows the connection live: Wi-Fi bars, Ethernet or Offline. Only its icon and
     // label change, so nothing is rebuilt.
     private ImageView netIcon;
+    // The frosted panel behind the app grid; rebuilt with the tiles.
+    private View panel;
     private int netState = -1;
     private final ConnectivityManager.NetworkCallback networkChanged = new ConnectivityManager.NetworkCallback() {
         @Override public void onAvailable(Network n) { runOnUiThread(MainActivity.this::refreshNetwork); }
@@ -199,6 +210,7 @@ public class MainActivity extends Activity {
         super.onCreate(state);
         saveConfig(getIntent());
         loadFonts();
+        try { getExternalFilesDir(null); } catch (Throwable ignored) {}
         scale = getResources().getDisplayMetrics().widthPixels / 1920f;
         showWallpaper(wallpaper());
 
@@ -456,7 +468,53 @@ public class MainActivity extends Activity {
     }
 
     private void showWallpaper(int i) {
-        getWindow().setBackgroundDrawable(background(WALLPAPERS[i]));
+        Drawable photo = photoBackground();
+        getWindow().setBackgroundDrawable(photo != null ? photo : background(WALLPAPERS[i]));
+    }
+
+    // The photo, if one was copied over: centre-cropped to the screen, darkened a little (more towards
+    // the bottom, where the labels sit) and painted once, like the gradients. Any problem returns null
+    // and the gradient wallpaper is used instead.
+    private Drawable photoBackground() {
+        try {
+            java.io.File dir = getExternalFilesDir(null);
+            if (dir == null) return null;
+            java.io.File f = new java.io.File(dir, PHOTO_FILE);
+            if (!f.isFile()) return null;
+            int w = getResources().getDisplayMetrics().widthPixels, h = getResources().getDisplayMetrics().heightPixels;
+            BitmapFactory.Options o = new BitmapFactory.Options();
+            o.inJustDecodeBounds = true;
+            BitmapFactory.decodeFile(f.getPath(), o);
+            if (o.outWidth <= 0 || o.outHeight <= 0) return null;
+            int sample = 1;
+            while (o.outWidth / (sample * 2) >= w && o.outHeight / (sample * 2) >= h) sample *= 2;
+            BitmapFactory.Options d = new BitmapFactory.Options();
+            d.inSampleSize = sample;
+            Bitmap src = BitmapFactory.decodeFile(f.getPath(), d);
+            if (src == null) return null;
+            Bitmap bm = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+            Canvas c = new Canvas(bm);
+            float k = Math.max((float) w / src.getWidth(), (float) h / src.getHeight());
+            Matrix mx = new Matrix();
+            mx.setScale(k, k);
+            mx.postTranslate((w - src.getWidth() * k) / 2f, (h - src.getHeight() * k) / 2f);
+            c.drawBitmap(src, mx, new Paint(Paint.FILTER_BITMAP_FLAG));
+            src.recycle();
+            GradientDrawable veil = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                    new int[] {0x33000000, 0x22000000, 0x8C000000});
+            veil.setBounds(0, 0, w, h);
+            veil.draw(c);
+            if (android.os.Build.VERSION.SDK_INT >= 26) {
+                Bitmap hw = bm.copy(Bitmap.Config.HARDWARE, false);
+                if (hw != null) {
+                    bm.recycle();
+                    bm = hw;
+                }
+            }
+            return new BitmapDrawable(getResources(), bm);
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
     // The wallpapers, each with a small dot of its colours. Moving through the list shows each one
@@ -506,6 +564,7 @@ public class MainActivity extends Activity {
             ((ViewGroup) wrap.getParent()).removeView(wrap);
         }
         tiles.clear();
+        if (panel != null && panel.getParent() != null) ((ViewGroup) panel.getParent()).removeView(panel);
         rowApps.clear();
         movingKey = null;
         moveHint.setVisibility(View.GONE);
@@ -528,6 +587,19 @@ public class MainActivity extends Activity {
         ((FrameLayout.LayoutParams) moveHint.getLayoutParams()).topMargin = gridTop - px(64);
         root.setMinimumHeight(bottomTop + h + px(MARGIN));
 
+        // Frosted glass behind all the tiles: translucent white with a faint edge, at the back.
+        panel = new View(this);
+        GradientDrawable pbg = new GradientDrawable();
+        pbg.setCornerRadius(px(PANEL_RADIUS));
+        pbg.setColor(0x26FFFFFF);
+        pbg.setStroke(Math.max(1, px(2)), 0x33FFFFFF);
+        panel.setBackground(pbg);
+        panel.setFocusable(false);
+        int pad = px(PANEL_PAD);
+        root.addView(panel, 0, at(m - pad, gridTop - pad,
+                getResources().getDisplayMetrics().widthPixels - 2 * m + 2 * pad,
+                bottomTop + h - gridTop + 2 * pad));
+
         for (String pkg : apps) {
             Intent li = launchIntent(pm, pkg);
             if (li == null) continue;
@@ -536,6 +608,7 @@ public class MainActivity extends Activity {
                 banner = pm.getActivityBanner(li);
                 if (banner == null) banner = pm.getApplicationBanner(pkg);
             } catch (Exception ignored) {}
+            if (ICON_TILES) banner = null; // icon and name on glass instead of the banner
             String label = pkg;
             try { label = pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString(); } catch (Exception ignored) {}
             // Apps without a TV banner get a plain tile with their normal icon.
@@ -601,7 +674,7 @@ public class MainActivity extends Activity {
             inner.setOrientation(LinearLayout.VERTICAL);
             inner.setGravity(Gravity.CENTER);
             ImageView iv = new ImageView(this);
-            int size = lineIcon != null ? px(44) : px(64);
+            int size = lineIcon != null ? px(44) : px(ICON_TILES ? 80 : 64);
             if (lineIcon != null) iv.setImageDrawable(new LineIcon(lineIcon));
             else if (appIcon != null) iv.setImageDrawable(fit(appIcon, size, size));
             inner.addView(iv, new LinearLayout.LayoutParams(size, size));
@@ -748,7 +821,7 @@ public class MainActivity extends Activity {
         FrameLayout card = new FrameLayout(this);
         final GradientDrawable bg = new GradientDrawable();
         bg.setShape(GradientDrawable.OVAL);
-        bg.setColor(Color.TRANSPARENT);
+        bg.setColor(0x26FFFFFF);
         card.setBackground(bg);
         ImageView iv = new ImageView(this);
         iv.setImageDrawable(icon);
@@ -758,7 +831,7 @@ public class MainActivity extends Activity {
         card.setContentDescription(label);
         card.setOnFocusChangeListener((v, has) -> {
             if (has) focusedKey = key;
-            lift(v, bg, has, Color.TRANSPARENT, 0x38FFFFFF, 0, 0);
+            lift(v, bg, has, 0x26FFFFFF, 0x59FFFFFF, 0, 0);
         });
         card.setOnClickListener(v -> open(key));
         FrameLayout wrap = new FrameLayout(this);
